@@ -3,6 +3,7 @@
  *  BER (Bearcats Electric Racing) - EV3 Vehicle Bus Dash
  *  Target:  ST7789 170x320 TFT (mounted landscape = 320x170)
  *  CAN DBC: CAN/EV4_Vehicle_Bus.dbc
+ *  CAN HW:  ESP32 TWAI + VP230/SN65HVD230 3.3V CAN transceiver
  *
  *  Button: GPIO 16 -> GND  (cycles display modes)
  *  Mode 0 - Overview:  two-column, all data, size-1 text
@@ -12,15 +13,18 @@
  *  ST7789 wiring:
  *    GND->GND  VCC->3.3V  SCL->GPIO18  SDA->GPIO23
  *    RES->GPIO22  DC->GPIO21  BLK->GPIO17  CS->GPIO5
- *  MCP2515 wiring (HSPI):
- *    SCK->GPIO14  SI->GPIO13  SO->GPIO12  CS->GPIO15  INT->GPIO4
+ *  VP230 wiring:
+ *    VCC->3.3V  GND->GND
+ *    CTX/TXD -> GPIO26
+ *    CRX/RXD -> GPIO27
+ *    CANH->CANH  CANL->CANL
  * ============================================================
  */
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
-#include <mcp_can.h>
+#include "driver/twai.h"
 
 // ── Pin definitions ──────────────────────────────────────────
 #define TFT_CS    5
@@ -29,16 +33,15 @@
 #define TFT_SCLK  18
 #define TFT_MOSI  23
 #define TFT_BL    17
-#define CAN_CS    15
-#define CAN_INT    4
-#define HSPI_SCK  14
-#define HSPI_MISO 12
-#define HSPI_MOSI 13
+#define TWAI_TX   26
+#define TWAI_RX   27
 #define BTN_PIN   16
 
+// 1 = safe passive monitor for the real vehicle bus.
+// 0 = normal ACKing node for a two-node bench test.
+#define DASH_TWAI_LISTEN_ONLY 1
+
 Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, TFT_CS, TFT_DC, TFT_RST);
-SPIClass hspi(HSPI);
-MCP_CAN CAN(&hspi, CAN_CS);
 
 // ── Display geometry (landscape 320x170) ─────────────────────
 #define SCREEN_W  320
@@ -148,12 +151,12 @@ void decodeFrame(uint32_t id, const uint8_t *b, uint8_t len) {
 }
 
 void readCANFrames() {
-  while (CAN.checkReceive() == CAN_MSGAVAIL) {
-    uint32_t id; uint8_t len; uint8_t buf[8];
-    if (CAN.readMsgBuf(&id, &len, buf) == CAN_OK) {
-      decodeFrame(id & 0x1FFFFFFF, buf, len);
-      rxCount++; lastRxMs = millis();
-    }
+  twai_message_t msg;
+  while (twai_receive(&msg, 0) == ESP_OK) {
+    if (msg.extd || msg.rtr) continue;
+    decodeFrame(msg.identifier, msg.data, msg.data_length_code);
+    rxCount++;
+    lastRxMs = millis();
   }
 }
 
@@ -557,11 +560,14 @@ void reportCANStatus() {
   static uint32_t lastReport = 0;
   if (millis() - lastReport < 2000) return;
   lastReport = millis();
-  byte err = CAN.getError();
+
+  twai_status_info_t status;
+  twai_get_status_info(&status);
   Serial.print("STATUS RX="); Serial.print(rxCount);
-  Serial.print(" EFLG=0x"); Serial.print(err, HEX);
-  Serial.print(" TEC="); Serial.print(CAN.errorCountTX());
-  Serial.print(" REC="); Serial.println(CAN.errorCountRX());
+  Serial.print(" STATE="); Serial.print(status.state);
+  Serial.print(" TEC="); Serial.print(status.tx_error_counter);
+  Serial.print(" REC="); Serial.print(status.rx_error_counter);
+  Serial.print(" RXQ="); Serial.println(status.msgs_to_rx);
 }
 
 // ── Hardware init ────────────────────────────────────────────
@@ -580,16 +586,28 @@ void setupDisplay() {
 }
 
 void setupCAN() {
-  hspi.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, CAN_CS);
-  pinMode(CAN_INT, INPUT);
-  byte r = CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ);
-  Serial.print("CAN.begin(): "); Serial.println(r == CAN_OK ? "OK" : "FAIL");
-  while (r != CAN_OK) {
-    Serial.println("MCP2515 init failed, retrying...");
+  twai_mode_t twaiMode = DASH_TWAI_LISTEN_ONLY ? TWAI_MODE_LISTEN_ONLY : TWAI_MODE_NORMAL;
+  twai_general_config_t generalConfig = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)TWAI_TX, (gpio_num_t)TWAI_RX, twaiMode);
+  twai_timing_config_t timingConfig = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t filterConfig = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  esp_err_t result = twai_driver_install(&generalConfig, &timingConfig, &filterConfig);
+  Serial.print("TWAI install: ");
+  Serial.println(result == ESP_OK ? "OK" : "FAIL");
+  while (result != ESP_OK) {
     delay(500);
-    r = CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ);
+    result = twai_driver_install(&generalConfig, &timingConfig, &filterConfig);
   }
-  Serial.println(CAN.setMode(MCP_NORMAL) == MCP2515_OK ? "CAN normal" : "CAN mode FAIL");
+
+  result = twai_start();
+  Serial.print("TWAI start: ");
+  Serial.println(result == ESP_OK ? "OK" : "FAIL");
+  while (result != ESP_OK) {
+    delay(500);
+    result = twai_start();
+  }
+
+  Serial.println(DASH_TWAI_LISTEN_ONLY ? "TWAI listen-only @ 500 kbps" : "TWAI normal @ 500 kbps");
 }
 
 void setup() {
