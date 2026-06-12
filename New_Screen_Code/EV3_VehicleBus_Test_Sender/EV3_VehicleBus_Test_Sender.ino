@@ -1,7 +1,7 @@
 /*
- * EV3 Vehicle Bus - Test Sender
+ * EV4 Vehicle Bus - Test Sender
  *
- * Sends simulated EV3_Vehicle_Bus.dbc frames so the dash display can be
+ * Sends simulated EV4_Vehicle_Bus.dbc frames so the dash display can be
  * verified without the real vehicle bus.
  *
  * Serial commands (115200 baud):
@@ -30,6 +30,12 @@
  *   powerlim <kW>    - BMS power limit
  *   water <t1> <t2> <t3> - water temps in C
  *   brake <0|1>      - brake pressed
+ *   accelx <m/s^2>   - IMU X acceleration
+ *   accely <m/s^2>   - IMU Y acceleration
+ *   accelz <m/s^2>   - IMU Z acceleration
+ *   gyrox <rad/s>    - IMU X gyro
+ *   gyroy <rad/s>    - IMU Y gyro
+ *   gyroz <rad/s>    - IMU Z gyro
  *   show             - print current values
  *   help             - print this list
  *
@@ -86,8 +92,12 @@ struct ManualState {
   uint8_t  water1C      = 34;
   uint8_t  water2C      = 36;
   uint8_t  water3C      = 38;
-  float    speedMph     = 0.0f;
-  float    tsVoltage    = 390.0f;
+  float    accelX       = 0.0f;
+  float    accelY       = 0.0f;
+  float    accelZ       = 9.81f;
+  float    gyroX        = 0.0f;
+  float    gyroY        = 0.0f;
+  float    gyroZ        = 0.0f;
 };
 
 ManualState manual;
@@ -101,6 +111,10 @@ void putU16(uint8_t *buf, uint8_t byteIndex, uint16_t value) {
 
 void putS16(uint8_t *buf, uint8_t byteIndex, int16_t value) {
   putU16(buf, byteIndex, (uint16_t)value);
+}
+
+void putFloat(uint8_t *buf, uint8_t byteIndex, float value) {
+  memcpy(buf + byteIndex, &value, 4);
 }
 
 void setBit(uint8_t *buf, uint8_t bit, bool value) {
@@ -146,8 +160,12 @@ void printHelp() {
   Serial.println("  mincellt <C>     min cell temp");
   Serial.println("  powerlim <kW>    BMS power limit");
   Serial.println("  water <t1> <t2> <t3>  water temps in C");
-  Serial.println("  speed <mph>      vehicle speed e.g. 42.5");
-  Serial.println("  ts <volts>       TS (pack) voltage e.g. 390.0");
+  Serial.println("  accelx <m/s^2>   IMU X acceleration");
+  Serial.println("  accely <m/s^2>   IMU Y acceleration");
+  Serial.println("  accelz <m/s^2>   IMU Z acceleration");
+  Serial.println("  gyrox <rad/s>    IMU X gyro");
+  Serial.println("  gyroy <rad/s>    IMU Y gyro");
+  Serial.println("  gyroz <rad/s>    IMU Z gyro");
   Serial.println("  show             print current values");
   Serial.println("  help             print this list");
   Serial.println();
@@ -180,9 +198,13 @@ void printState() {
   Serial.print("/");           Serial.print(manual.water2C);
   Serial.print("/");           Serial.print(manual.water3C);
   Serial.print("C plim=");     Serial.print(manual.powerLimKw);
-  Serial.print("kW speed=");   Serial.print(manual.speedMph, 1);
-  Serial.print("mph ts=");     Serial.print(manual.tsVoltage, 1);
-  Serial.println("V");
+  Serial.println("kW");
+  Serial.print("accel=");      Serial.print(manual.accelX, 3);
+  Serial.print("/");           Serial.print(manual.accelY, 3);
+  Serial.print("/");           Serial.print(manual.accelZ, 3);
+  Serial.print(" gyro=");      Serial.print(manual.gyroX, 3);
+  Serial.print("/");           Serial.print(manual.gyroY, 3);
+  Serial.print("/");           Serial.println(manual.gyroZ, 3);
 }
 
 void handleCommand(String line) {
@@ -239,8 +261,12 @@ void handleCommand(String line) {
   else if (cmd == "maxcellt") { manual.maxCellTempC = clampF(arg1, 0, 150); }
   else if (cmd == "mincellt") { manual.minCellTempC = clampF(arg1, 0, 150); }
   else if (cmd == "powerlim") { manual.powerLimKw   = (uint8_t)clampF(arg1, 0, 255); }
-  else if (cmd == "speed")    { manual.speedMph     = clampF(arg1, 0, 999); }
-  else if (cmd == "ts")       { manual.tsVoltage    = clampF(arg1, 0, 999); }
+  else if (cmd == "accelx")   { manual.accelX = arg1; }
+  else if (cmd == "accely")   { manual.accelY = arg1; }
+  else if (cmd == "accelz")   { manual.accelZ = arg1; }
+  else if (cmd == "gyrox")    { manual.gyroX  = arg1; }
+  else if (cmd == "gyroy")    { manual.gyroY  = arg1; }
+  else if (cmd == "gyroz")    { manual.gyroZ  = arg1; }
   else if (cmd == "water") {
     int s1 = rest.indexOf(' ');
     if (s1 >= 0) {
@@ -276,35 +302,83 @@ void readSerial() {
 }
 
 // ── Frame sending ────────────────────────────────────────────
-void printByteHex(uint8_t value) {
-  if (value < 0x10) Serial.print('0');
-  Serial.print(value, HEX);
-}
-
 void sendFrame(uint16_t id, uint8_t *buf) {
   CAN.sendMsgBuf(id, 0, 8, buf);
 }
 
 void sendAutoFrames() {
   uint8_t buf[8] = {0};
-  uint8_t phase = tick % 100;
 
-  bool demoFault  = (tick % 80) >= 65;
-  bool r2d        = (tick % 40) >= 8;
-  bool precharge  = (tick % 50) >= 5;
-  bool regen      = (tick % 60) >= 30;
-  uint8_t driveMode = (tick / 25) % 6;
-  uint8_t appsPct   = phase;
-  int16_t torqueCmd = (int16_t)((int)appsPct * 4 - (regen ? 60 : 0));
-  uint16_t powerKw  = (uint16_t)((appsPct * 80UL) / 100UL);
-  uint16_t lvAdc    = 124;
-  uint8_t battSoc   = 92 - (tick % 50);
+  // t in seconds (tick fires every 250 ms)
+  float t = tick * 0.25f;
 
+  // ── Throttle: sawtooth 0→100% over 20 s, brief lift at top ──
+  float sawPos  = fmodf(t, 20.0f) / 20.0f;           // 0.0–1.0
+  uint8_t appsPct = (sawPos < 0.85f)
+                    ? (uint8_t)(sawPos / 0.85f * 100.0f)
+                    : (uint8_t)((1.0f - sawPos) / 0.15f * 15.0f);
+
+  bool regen    = (appsPct < 8);
+  int16_t torqueCmd = regen ? (int16_t)(-40)
+                             : (int16_t)(appsPct * 3);
+  uint16_t powerKw  = (uint16_t)(appsPct * 80UL / 100UL);
+
+  // ── SOC: drains 100→20% over ~80 s then resets ──────────────
+  uint8_t battSoc = (uint8_t)(100.0f - fmodf(t, 80.0f) / 80.0f * 80.0f);
+
+  // ── LV voltage: 12.0–13.5 V gentle oscillation ───────────────
+  uint16_t lvAdc = (uint16_t)(125.0f + 8.0f * sinf(t * 0.15f)); // x0.1 V
+
+  // ── Drive mode: cycles through all 6 every 15 s ──────────────
+  uint8_t driveMode = (uint8_t)(fmodf(t, 90.0f) / 15.0f);
+
+  // ── State flags ───────────────────────────────────────────────
+  bool precharge = true;
+  bool r2d       = (fmodf(t, 40.0f) >= 3.0f);   // 3-s gap at start of each lap
+  bool initDone  = (fmodf(t, 40.0f) >= 1.5f);
+
+  // ── Brief fault pulse every 30 s for 2 s ─────────────────────
+  bool demoFault = (fmodf(t, 30.0f) < 2.0f);
+
+  // ── BPS / brake: spikes when throttle lifts ──────────────────
+  bool brakeOn  = regen && (appsPct < 4);
+  uint16_t bpsRaw = brakeOn ? 650 : (uint16_t)(180.0f + 40.0f * sinf(t * 0.4f));
+
+  // ── Water temps: rise with load, baseline oscillation ────────
+  uint8_t water1C = (uint8_t)(30.0f + appsPct * 0.18f + 4.0f * sinf(t * 0.07f));
+  uint8_t water2C = water1C + 3;
+  uint8_t water3C = water1C + 6;
+
+  // ── Cell voltages: track SOC ──────────────────────────────────
+  float maxCellV  = 3.60f + (battSoc / 100.0f) * 0.58f;   // 3.60–4.18 V
+  float minCellV  = maxCellV - 0.12f - 0.04f * sinf(t * 0.2f);
+
+  // ── Cell temps: load-dependent ────────────────────────────────
+  float maxCellT  = 25.0f + appsPct * 0.22f + 4.0f * sinf(t * 0.11f);
+  float minCellT  = maxCellT - 7.0f;
+
+  // ── BMS current/limit ─────────────────────────────────────────
+  float bmsCurrent = 8.0f + appsPct * 1.6f;
+  uint8_t powerLim = (maxCellT > 42.0f) ? 60 : 80;
+
+  // ── IMU: simulated lap cornering ─────────────────────────────
+  float accelX = 3.5f * sinf(t * 0.25f);              // lateral ±3.5 m/s²
+  float accelY = (appsPct / 100.0f) * 6.0f            // longitudinal
+                 - (brakeOn ? 4.0f : 0.0f);
+  float accelZ = 9.81f + 0.4f * sinf(t * 0.55f);
+  float gyroX  = 0.08f * sinf(t * 0.9f);
+  float gyroY  = 0.08f * cosf(t * 0.9f);
+  float gyroZ  = 0.35f * sinf(t * 0.25f);             // yaw rate with accelX
+
+  // ── Send frames ───────────────────────────────────────────────
+
+  // ID 0x2 ECU_FAULTS
   memset(buf, 0, 8);
   setBit(buf, 4, demoFault);
   setBit(buf, 7, demoFault);
   sendFrame(0x2, buf);
 
+  // ID 0x3 MC_FAULTS
   memset(buf, 0, 8);
   setBit(buf, 2, demoFault);
   setBit(buf, 25, demoFault);
@@ -312,6 +386,7 @@ void sendAutoFrames() {
   setBit(buf, 57, demoFault);
   sendFrame(0x3, buf);
 
+  // ID 0x4 APPS_Info
   memset(buf, 0, 8);
   putU16(buf, 0, 800 + appsPct * 10);
   putU16(buf, 2, 820 + appsPct * 10);
@@ -319,42 +394,58 @@ void sendAutoFrames() {
   putS16(buf, 5, torqueCmd);
   sendFrame(0x4, buf);
 
+  // ID 0x5 Sensors_Info
   memset(buf, 0, 8);
-  putU16(buf, 0, 300 + appsPct * 4);
-  buf[2] = 34 + (tick % 8);
-  buf[3] = 36 + (tick % 7);
-  buf[4] = 38 + (tick % 6);
+  putU16(buf, 0, bpsRaw);
+  buf[2] = water1C;
+  buf[3] = water2C;
+  buf[4] = water3C;
   setBit(buf, 40, r2d);
-  setBit(buf, 41, (tick % 20) < 5);
-  setBit(buf, 42, (tick % 30) < 8);
-  setBit(buf, 43, appsPct < 8);
+  setBit(buf, 41, false);
+  setBit(buf, 42, false);
+  setBit(buf, 43, brakeOn);
   sendFrame(0x5, buf);
 
+  // ID 0x6 Internal_States
   memset(buf, 0, 8);
   putU16(buf, 0, powerKw);
   putU16(buf, 2, lvAdc);
   buf[4] = battSoc;
-  setBit(buf, 40, true);
+  setBit(buf, 40, initDone);
   setBit(buf, 41, precharge);
   setBit(buf, 42, r2d);
   buf[5] |= (driveMode & 0x07) << 3;
   setBit(buf, 46, regen);
   sendFrame(0x6, buf);
 
+  // ID 0x7 BMS_Info
   memset(buf, 0, 8);
   buf[0] = encodeBmsSoc((float)battSoc);
-  buf[1] = encodeBmsCurrent(20.0f + appsPct * 1.2f);
-  buf[2] = encodeCellVolt(4.08f);
-  buf[3] = encodeCellTemp(36.0f + (tick % 12));
-  buf[4] = encodeCellVolt(3.72f);
-  buf[5] = encodeCellTemp(30.0f + (tick % 8));
-  buf[6] = 80 - (tick % 25);
+  buf[1] = encodeBmsCurrent(bmsCurrent);
+  buf[2] = encodeCellVolt(maxCellV);
+  buf[3] = encodeCellTemp(maxCellT);
+  buf[4] = encodeCellVolt(minCellV);
+  buf[5] = encodeCellTemp(minCellT);
+  buf[6] = powerLim;
   sendFrame(0x7, buf);
 
+  // ID 0x8 IMU_Z  (Accel_Z bytes 0-3, Gyro_Z bytes 4-7)
   memset(buf, 0, 8);
-  putU16(buf, 0, (uint16_t)(appsPct * 6));   // 0-60 mph scaled from throttle
-  putU16(buf, 2, (uint16_t)(3900));           // 390.0V constant TS voltage
+  putFloat(buf, 0, accelZ);
+  putFloat(buf, 4, gyroZ);
   sendFrame(0x8, buf);
+
+  // ID 0x9 IMU_Gyro_XY  (Gyro_X bytes 0-3, Gyro_Y bytes 4-7)
+  memset(buf, 0, 8);
+  putFloat(buf, 0, gyroX);
+  putFloat(buf, 4, gyroY);
+  sendFrame(0x9, buf);
+
+  // ID 0xA IMU_Accel_XY  (Accel_X bytes 0-3, Accel_Y bytes 4-7)
+  memset(buf, 0, 8);
+  putFloat(buf, 0, accelX);
+  putFloat(buf, 4, accelY);
+  sendFrame(0xA, buf);
 
   tick++;
 }
@@ -362,12 +453,14 @@ void sendAutoFrames() {
 void sendManualFrames() {
   uint8_t buf[8] = {0};
 
+  // ID 0x2 ECU_FAULTS
   memset(buf, 0, 8);
   setBit(buf, 4, manual.fault);
   setBit(buf, 7, manual.fault);
   setBit(buf, 9, manual.fault);
   sendFrame(0x2, buf);
 
+  // ID 0x3 MC_FAULTS
   memset(buf, 0, 8);
   setBit(buf, 2, manual.inv1Fault);
   setBit(buf, 25, manual.inv1Fault);
@@ -375,6 +468,7 @@ void sendManualFrames() {
   setBit(buf, 57, manual.inv2Fault);
   sendFrame(0x3, buf);
 
+  // ID 0x4 APPS_Info
   memset(buf, 0, 8);
   putU16(buf, 0, 800 + manual.appsPct * 10);
   putU16(buf, 2, 820 + manual.appsPct * 10);
@@ -382,6 +476,7 @@ void sendManualFrames() {
   putS16(buf, 5, manual.torqueCmd);
   sendFrame(0x4, buf);
 
+  // ID 0x5 Sensors_Info
   memset(buf, 0, 8);
   putU16(buf, 0, manual.bpsRaw);
   buf[2] = manual.water1C;
@@ -393,6 +488,7 @@ void sendManualFrames() {
   setBit(buf, 43, manual.brake);
   sendFrame(0x5, buf);
 
+  // ID 0x6 Internal_States
   memset(buf, 0, 8);
   putU16(buf, 0, manual.powerKw);
   putU16(buf, 2, manual.lvAdc);
@@ -404,6 +500,7 @@ void sendManualFrames() {
   setBit(buf, 46, manual.regen);
   sendFrame(0x6, buf);
 
+  // ID 0x7 BMS_Info
   memset(buf, 0, 8);
   buf[0] = encodeBmsSoc((float)manual.battSoc);
   buf[1] = encodeBmsCurrent(manual.bmsCurrent);
@@ -414,17 +511,30 @@ void sendManualFrames() {
   buf[6] = manual.powerLimKw;
   sendFrame(0x7, buf);
 
+  // ID 0x8 IMU_Z  (Accel_Z bytes 0-3, Gyro_Z bytes 4-7)
   memset(buf, 0, 8);
-  putU16(buf, 0, (uint16_t)(manual.speedMph  * 10.0f + 0.5f));
-  putU16(buf, 2, (uint16_t)(manual.tsVoltage * 10.0f + 0.5f));
+  putFloat(buf, 0, manual.accelZ);
+  putFloat(buf, 4, manual.gyroZ);
   sendFrame(0x8, buf);
+
+  // ID 0x9 IMU_Gyro_XY  (Gyro_X bytes 0-3, Gyro_Y bytes 4-7)
+  memset(buf, 0, 8);
+  putFloat(buf, 0, manual.gyroX);
+  putFloat(buf, 4, manual.gyroY);
+  sendFrame(0x9, buf);
+
+  // ID 0xA IMU_Accel_XY  (Accel_X bytes 0-3, Accel_Y bytes 4-7)
+  memset(buf, 0, 8);
+  putFloat(buf, 0, manual.accelX);
+  putFloat(buf, 4, manual.accelY);
+  sendFrame(0xA, buf);
 }
 
 // ── Setup / loop ─────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("[EV3 Vehicle Bus Test Sender] Boot");
+  Serial.println("[EV4 Vehicle Bus Test Sender] Boot");
 
   hspi.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, CAN_CS);
   pinMode(CAN_INT, INPUT);
